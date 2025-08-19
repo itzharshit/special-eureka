@@ -2,3 +2,4 @@ aiogram==3.4.1
 fastapi==0.110.0
 uvicorn[standard]==0.29.0
 mega.py==1.0.8
+tenacity<8
