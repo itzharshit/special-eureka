@@ -1,7 +1,11 @@
-import asyncio
+
+
 import os
+import asyncio
 import tempfile
-import traceback
+import logging
+from pathlib import Path
+
 from fastapi import FastAPI, Request
 from aiogram import Bot, Dispatcher, F
 from aiogram.types import Message, FSInputFile, Update
@@ -9,134 +13,156 @@ from aiogram.enums import ParseMode
 from aiogram.client.default import DefaultBotProperties
 from aiogram.exceptions import TelegramRetryAfter
 import uvicorn
-import logging
-from mega_py import Mega   # ✅ use mega.pyx instead of mega.py
 
-logging.basicConfig(level=logging.INFO)
-logger = logging.getLogger(__name__)
-
-API_TOKEN = os.getenv("BOT_TOKEN")
-if not API_TOKEN:
-    raise ValueError("BOT_TOKEN environment variable is not set.")
-
-WEBHOOK_URL = os.getenv("WEBHOOK_URL")
-if not WEBHOOK_URL:
-    raise ValueError("WEBHOOK_URL environment variable is not set.")
-
+# ------------------------------------------------------------------
+# 0.  Environment
+# ------------------------------------------------------------------
+API_TOKEN   = os.getenv("BOT_TOKEN")   # Telegram bot token
+WEBHOOK_URL = os.getenv("WEBHOOK_URL") # https://<your-app>.leapcell.dev
 WEBHOOK_PATH = "/webhook"
 
-bot = Bot(token=API_TOKEN, default=DefaultBotProperties(parse_mode=ParseMode.HTML))
+if not API_TOKEN or not WEBHOOK_URL:
+    raise RuntimeError("BOT_TOKEN and WEBHOOK_URL env vars are required")
+
+# ------------------------------------------------------------------
+# 1.  Logging
+# ------------------------------------------------------------------
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
+)
+log = logging.getLogger("mega-bot")
+
+# ------------------------------------------------------------------
+# 2.  Bot & Dispatcher
+# ------------------------------------------------------------------
+bot = Bot(
+    API_TOKEN,
+    default=DefaultBotProperties(parse_mode=ParseMode.HTML),
+)
 dp = Dispatcher()
 
+# ------------------------------------------------------------------
+# 3.  Handlers
+# ------------------------------------------------------------------
+START_TXT = "👋 Hello! Send me any <b>public</b> MEGA.nz link and I’ll download & upload it here."
 
 @dp.message(F.text == "/start")
 async def cmd_start(message: Message):
-    await message.answer("👋 Hello! Send me a public Mega.nz link and I’ll download & upload it for you.")
+    await message.answer(START_TXT)
 
+MEGA_PREFIXES = (
+    "https://mega.nz/",
+    "http://mega.nz/",
+    "https://mega.co.nz/",
+    "http://mega.co.nz/",
+)
 
-@dp.message(F.text.startswith("https://mega.nz/") | F.text.startswith("https://mega.co.nz/"))
+@dp.message(F.text.startswith(MEGA_PREFIXES))
 async def handle_mega(message: Message) -> None:
     link = message.text.strip()
-    progress_msg = await message.answer("📥 Starting download…")
+    status = await message.answer("⏳ Preparing download…")
+
+    # ------------------------------------------------------------------
+    # 3-a  Download section
+    # ------------------------------------------------------------------
+    tmpdir = Path(tempfile.mkdtemp(dir="/tmp"))
+    outdir = tmpdir / "out"
+    outdir.mkdir()
 
     try:
-        with tempfile.TemporaryDirectory(dir="/tmp") as tmpdir:
-            mega = Mega()
-            await progress_msg.edit_text("📥 Connecting to Mega...")
-            m = mega.login()  # ✅ anonymous login (no creds needed)
+        await _download_public_mega(link, outdir, status)
+        files = list(outdir.rglob("*"))
+        files = [p for p in files if p.is_file()]
+        if not files:
+            await status.edit_text("⚠️ Nothing was downloaded. Is the link valid & public?")
+            return
 
-            await progress_msg.edit_text("📥 Getting file info...")
-            file_info = m.get_public_url_info(link)
-            if not file_info:
-                await progress_msg.edit_text("❌ Could not retrieve file information. Is the link valid and public?")
-                return
-
-            file_name = file_info["name"]
-            await progress_msg.edit_text(f"📥 Downloading <code>{file_name}</code>...")
-
-            loop = asyncio.get_event_loop()
-            file_path = await loop.run_in_executor(None, m.download_url, link, tmpdir)
-
-            if file_path and os.path.exists(file_path):
-                await progress_msg.edit_text("📤 Uploading file...")
-                await bot.send_document(
-                    chat_id=message.chat.id,
-                    document=FSInputFile(file_path),
-                    caption=f"<code>{file_name}</code>",
-                    disable_content_type_detection=True,
-                )
-                await progress_msg.delete()
-            else:
-                await progress_msg.edit_text("❌ Download failed or file not found.")
-    except Exception as e:
-        logger.error(f"Error processing Mega link: {e}\n{traceback.format_exc()}")
+        # ------------------------------------------------------------------
+        # 3-b  Upload section
+        # ------------------------------------------------------------------
+        await status.edit_text("📤 Uploading to Telegram…")
+        for f in files:
+            await _upload_file(f, message.chat.id, status)
+        await status.delete()
+    finally:
+        # Clean up no matter what
+        for p in outdir.rglob("*"):
+            if p.is_file():
+                try:
+                    p.unlink(missing_ok=True)
+                except Exception:
+                    pass
         try:
-            await progress_msg.edit_text(f"❌ An error occurred: <code>{str(e)[:100]}...</code>")
-        except:
+            outdir.rmdir()
+            tmpdir.rmdir()
+        except Exception:
             pass
 
+# ------------------------------------------------------------------
+# 4.  Downloader (pure-Python, no CLI tools)
+# ------------------------------------------------------------------
+from mega import Mega  # pip install mega.py
 
+async def _download_public_mega(url: str, dest: Path, status: Message) -> None:
+    loop = asyncio.get_running_loop()
+    mega = Mega()
+
+    def _sync_dl():
+        m = mega.login()  # anonymous
+        return m.download_url(str(url), str(dest))
+
+    await loop.run_in_executor(None, _sync_dl)
+
+# ------------------------------------------------------------------
+# 5.  Uploader
+# ------------------------------------------------------------------
+async def _upload_file(file_path: Path, chat_id: int, status: Message) -> None:
+    try:
+        await bot.send_document(
+            chat_id=chat_id,
+            document=FSInputFile(str(file_path)),
+            disable_content_type_detection=True,
+        )
+    except TelegramRetryAfter as e:
+        log.warning("Flood wait %ss for %s", e.retry_after, file_path.name)
+        await asyncio.sleep(e.retry_after)
+        await bot.send_document(
+            chat_id=chat_id,
+            document=FSInputFile(str(file_path)),
+            disable_content_type_detection=True,
+        )
+
+# ------------------------------------------------------------------
+# 6.  FastAPI webhook plumbing
+# ------------------------------------------------------------------
 app = FastAPI()
-
 
 @app.post(WEBHOOK_PATH)
 async def webhook(request: Request):
-    try:
-        data = await request.json()
-        update = Update.model_validate(data)
-        asyncio.create_task(dp.feed_update(bot, update))
-        return {"ok": True}
-    except Exception as e:
-        logger.error(f"Error processing webhook: {e}", exc_info=True)
-        return {"ok": True}
+    data = await request.json()
+    update = Update.model_validate(data)
+    await dp.feed_update(bot, update)
+    return {"ok": True}
 
-
-@app.get("/kaithheathcheck")
-async def healthcheck():
+@app.get("/health")  # Leapcell health-check
+async def health():
     return {"status": "ok"}
 
-
+# ------------------------------------------------------------------
+# 7.  Startup / shutdown
+# ------------------------------------------------------------------
 @app.on_event("startup")
 async def on_startup():
-    logger.info("Starting up...")
-    max_retries = 5
-    retry_delay = 5
-    for attempt in range(max_retries):
-        try:
-            webhook_url = WEBHOOK_URL + WEBHOOK_PATH
-            logger.info(f"Setting webhook to {webhook_url}")
-            await bot.set_webhook(webhook_url)
-            logger.info("Webhook set successfully.")
-            break
-        except TelegramRetryAfter as e:
-            logger.warning(
-                f"Telegram API rate limit on set_webhook (attempt {attempt+1}): {e}. Waiting {e.retry_after}s."
-            )
-            await asyncio.sleep(e.retry_after)
-        except Exception as e:
-            logger.error(f"Error setting webhook (attempt {attempt+1}): {e}", exc_info=True)
-            if attempt < max_retries - 1:
-                logger.info(f"Retrying in {retry_delay} seconds...")
-                await asyncio.sleep(retry_delay)
-            else:
-                logger.error("Failed to set webhook after maximum retries.")
-
+    await bot.set_webhook(WEBHOOK_URL + WEBHOOK_PATH)
 
 @app.on_event("shutdown")
 async def on_shutdown():
-    logger.info("Shutting down...")
-    try:
-        await bot.delete_webhook()
-        logger.info("Webhook deleted.")
-    except Exception as e:
-        logger.error(f"Error deleting webhook: {e}")
-    try:
-        await bot.session.close()
-        logger.info("Bot session closed.")
-    except Exception as e:
-        logger.error(f"Error closing bot session: {e}")
+    await bot.delete_webhook()
+    await bot.session.close()
 
-
+# ------------------------------------------------------------------
+# 8.  Entrypoint
+# ------------------------------------------------------------------
 if __name__ == "__main__":
-    logger.info("Starting Uvicorn server...")
     uvicorn.run(app, host="0.0.0.0", port=8000)
