@@ -1,7 +1,6 @@
 import asyncio
 import os
 import tempfile
-import math
 from fastapi import FastAPI, Request
 from aiogram import Bot, Dispatcher, F
 from aiogram.types import Message, FSInputFile, Update
@@ -11,13 +10,18 @@ from aiogram.exceptions import TelegramRetryAfter
 import uvicorn
 
 API_TOKEN = os.getenv("BOT_TOKEN")
-WEBHOOK_URL = os.getenv("WEBHOOK_URL")  # Must be full https URL
+WEBHOOK_URL = os.getenv("WEBHOOK_URL")  # Must be public HTTPS
 WEBHOOK_PATH = "/webhook"
 
 bot = Bot(API_TOKEN, default=DefaultBotProperties(parse_mode=ParseMode.HTML))
 dp = Dispatcher()
 
 # ---------------- Handlers ----------------
+
+@dp.message(F.text == "/start")
+async def cmd_start(message: Message):
+    await message.answer("👋 Hello! Send me a Mega.nz link and I’ll download & upload it for you.")
+
 @dp.message(F.text.startswith("https://mega.nz/") | F.text.startswith("https://mega.co.nz/"))
 async def handle_mega(message: Message) -> None:
     link = message.text.strip()
@@ -80,10 +84,18 @@ async def webhook(request: Request):
     await dp.feed_update(bot, update)
     return {"ok": True}
 
+@app.get("/kaithheathcheck")  # For Leapcell health checks
+async def healthcheck():
+    return {"status": "ok"}
+
 @app.on_event("startup")
 async def on_startup():
-    # Must be a valid HTTPS URL accessible from Telegram
-    await bot.set_webhook(WEBHOOK_URL + WEBHOOK_PATH)
+    try:
+        await bot.set_webhook(WEBHOOK_URL + WEBHOOK_PATH)
+    except TelegramRetryAfter as e:
+        print(f"⚠️ Flood control: retry after {e.retry_after}s")
+        await asyncio.sleep(e.retry_after)
+        await bot.set_webhook(WEBHOOK_URL + WEBHOOK_PATH)
 
 @app.on_event("shutdown")
 async def on_shutdown():
